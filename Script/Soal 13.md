@@ -1,0 +1,186 @@
+### Soal 13
+
+##### `yaga` & `inumaki` : install MariaDB
+
+```bash
+apt-get update
+apt-get install -y mariadb-server mariadb-client openssl
+mkdir -p /root/mariadb
+```
+
+##### `yaga` : konfigurasi master
+
+```bash
+cat > /root/mariadb/60-shibuya.cnf <<'EOF'
+[mariadb]
+server-id=1
+bind-address=0.0.0.0
+log-bin=mariadb-bin
+binlog-format=ROW
+EOF
+cp /root/mariadb/60-shibuya.cnf /etc/mysql/mariadb.conf.d/
+service mariadb restart
+mariadb -e "SHOW VARIABLES WHERE Variable_name IN ('server_id','log_bin','bind_address');"
+```
+
+##### `inumaki` : konfigurasi slave
+
+```bash
+cat > /root/mariadb/60-shibuya.cnf <<'EOF'
+[mariadb]
+server-id=2
+bind-address=0.0.0.0
+relay-log=inumaki-relay-bin
+read-only=ON
+EOF
+cp /root/mariadb/60-shibuya.cnf /etc/mysql/mariadb.conf.d/
+service mariadb restart
+```
+
+##### `yaga` : buat kredensial, database, dan tabel
+
+```bash
+umask 077
+if [ ! -f /root/db-secrets.env ]; then
+    APP_DB_PASS=$(openssl rand -hex 20)
+    REPL_PASS=$(openssl rand -hex 20)
+    printf "APP_DB_PASS='%s'\nREPL_PASS='%s'\n" \
+        "$APP_DB_PASS" "$REPL_PASS" > /root/db-secrets.env
+fi
+. /root/lab.env
+. /root/db-secrets.env
+cat > /root/mariadb/create_shibuya.sql <<EOF
+CREATE DATABASE IF NOT EXISTS ${DB_NAME};
+CREATE TABLE IF NOT EXISTS ${DB_NAME}.request_logs (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    worker VARCHAR(32) NOT NULL,
+    client_ip VARCHAR(45) NOT NULL,
+    request_uri VARCHAR(2048) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB;
+CREATE USER IF NOT EXISTS 'replicator'@'${INUMAKI}'
+    IDENTIFIED BY '${REPL_PASS}';
+GRANT REPLICATION SLAVE ON *.* TO 'replicator'@'${INUMAKI}';
+CREATE USER IF NOT EXISTS 'shibuya_app'@'${P}.4.%'
+    IDENTIFIED BY '${APP_DB_PASS}';
+GRANT SELECT, INSERT ON ${DB_NAME}.* TO 'shibuya_app'@'${P}.4.%';
+EOF
+mariadb < /root/mariadb/create_shibuya.sql
+mariadb -e "SHOW MASTER STATUS; SHOW CREATE TABLE ${DB_NAME}.request_logs\G"
+```
+
+##### `yaga` : buat snapshot dan koordinat binlog
+
+```bash
+. /root/lab.env
+mariadb-dump --single-transaction --master-data=2 \
+    --databases "$DB_NAME" > /root/mariadb/shibuya-seed.sql
+sed -n '/^-- CHANGE MASTER TO/p' /root/mariadb/shibuya-seed.sql
+sha256sum /root/mariadb/shibuya-seed.sql
+base64 /root/mariadb/shibuya-seed.sql
+```
+
+##### `inumaki` : import snapshot
+
+```bash
+cat > /root/mariadb/shibuya-seed.b64 <<'EOF'
+LypNITk5OTk5OVwtIGVuYWJsZSB0aGUgc2FuZGJveCBtb2RlICovIAotLSBNYXJpYURCIGR1bXAg
+MTAuMTktMTEuOC42LU1hcmlhREIsIGZvciBkZWJpYW4tbGludXgtZ251ICh4ODZfNjQpCi0tCi0t
+IEhvc3Q6IGxvY2FsaG9zdCAgICBEYXRhYmFzZTogZGJfc2hpYnV5YV9LMTAKLS0gLS0tLS0tLS0t
+LS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCi0tIFNlcnZlciB2
+ZXJzaW9uCTExLjguNi1NYXJpYURCLTArZGViMTN1MSBmcm9tIERlYmlhbi1sb2cKCi8qITQwMTAx
+IFNFVCBAT0xEX0NIQVJBQ1RFUl9TRVRfQ0xJRU5UPUBAQ0hBUkFDVEVSX1NFVF9DTElFTlQgKi87
+Ci8qITQwMTAxIFNFVCBAT0xEX0NIQVJBQ1RFUl9TRVRfUkVTVUxUUz1AQENIQVJBQ1RFUl9TRVRf
+UkVTVUxUUyAqLzsKLyohNDAxMDEgU0VUIEBPTERfQ09MTEFUSU9OX0NPTk5FQ1RJT049QEBDT0xM
+QVRJT05fQ09OTkVDVElPTiAqLzsKLyohNDAxMDEgU0VUIE5BTUVTIHV0ZjhtYjQgKi87Ci8qITQw
+MTAzIFNFVCBAT0xEX1RJTUVfWk9ORT1AQFRJTUVfWk9ORSAqLzsKLyohNDAxMDMgU0VUIFRJTUVf
+Wk9ORT0nKzAwOjAwJyAqLzsKLyohNDAwMTQgU0VUIEBPTERfVU5JUVVFX0NIRUNLUz1AQFVOSVFV
+RV9DSEVDS1MsIFVOSVFVRV9DSEVDS1M9MCAqLzsKLyohNDAwMTQgU0VUIEBPTERfRk9SRUlHTl9L
+RVlfQ0hFQ0tTPUBARk9SRUlHTl9LRVlfQ0hFQ0tTLCBGT1JFSUdOX0tFWV9DSEVDS1M9MCAqLzsK
+LyohNDAxMDEgU0VUIEBPTERfU1FMX01PREU9QEBTUUxfTU9ERSwgU1FMX01PREU9J05PX0FVVE9f
+VkFMVUVfT05fWkVSTycgKi87Ci8qTSExMDA2MTYgU0VUIEBPTERfTk9URV9WRVJCT1NJVFk9QEBO
+T1RFX1ZFUkJPU0lUWSwgTk9URV9WRVJCT1NJVFk9MCAqLzsKCi0tCi0tIEFsdGVybmF0ZWx5LCBm
+b2xsb3dpbmcgaXMgdGhlIHBvc2l0aW9uIG9mIHRoZSBiaW5hcnkgbG9nZ2luZyBmcm9tIFNIT1cg
+TUFTVEVSIFNUQVRVUyBhdCBwb2ludCBvZiBiYWNrdXAuCi0tIFVzZSB0aGlzIHdoZW4gY3JlYXRp
+bmcgYSByZXBsaWNhIG9mIHRoZSBwcmltYXJ5IHNlcnZlciB3aGVyZSB0aGUgYmFja3VwIHdhcyBt
+YWRlLgotLSBUaGUgbmV3IHNlcnZlciB3aWxsIGJlIGNvbm5lY3RpbmcgdG8gdGhlIHByaW1hcnkg
+c2VydmVyIHdoZXJlIHRoZSBiYWNrdXAgd2FzIHRha2VuLgotLQoKLS0gQ0hBTkdFIE1BU1RFUiBU
+TyBNQVNURVJfTE9HX0ZJTEU9J21hcmlhZGItYmluLjAwMDAwMScsIE1BU1RFUl9MT0dfUE9TPTE3
+MjA7CgotLSBBIGNvcnJlc3BvbmRpbmcgdG8gdGhlIGFib3ZlIG1hc3Rlci1kYXRhIENIQU5HRS1N
+QVNURVIgc2V0dGluZ3MgdG8gdGhlIHNsYXZlIGd0aWQgc3RhdGUgaXMgcHJpbnRlZCBhcyBjb21t
+ZW50cyBsYXRlciBpbiB0aGUgZmlsZS4KCi0tCi0tIEN1cnJlbnQgRGF0YWJhc2U6IGBkYl9zaGli
+dXlhX0sxMGAKLS0KCkNSRUFURSBEQVRBQkFTRSAvKiEzMjMxMiBJRiBOT1QgRVhJU1RTKi8gYGRi
+X3NoaWJ1eWFfSzEwYCAvKiE0MDEwMCBERUZBVUxUIENIQVJBQ1RFUiBTRVQgdXRmOG1iNCBDT0xM
+QVRFIHV0ZjhtYjRfdWNhMTQwMF9haV9jaSAqLzsKClVTRSBgZGJfc2hpYnV5YV9LMTBgOwoKLS0K
+LS0gVGFibGUgc3RydWN0dXJlIGZvciB0YWJsZSBgcmVxdWVzdF9sb2dzYAotLQoKRFJPUCBUQUJM
+RSBJRiBFWElTVFMgYHJlcXVlc3RfbG9nc2A7Ci8qITQwMTAxIFNFVCBAc2F2ZWRfY3NfY2xpZW50
+ICAgICA9IEBAY2hhcmFjdGVyX3NldF9jbGllbnQgKi87Ci8qITQwMTAxIFNFVCBjaGFyYWN0ZXJf
+c2V0X2NsaWVudCA9IHV0ZjhtYjQgKi87CkNSRUFURSBUQUJMRSBgcmVxdWVzdF9sb2dzYCAoCiAg
+YGlkYCBiaWdpbnQoMjApIHVuc2lnbmVkIE5PVCBOVUxMIEFVVE9fSU5DUkVNRU5ULAogIGB3b3Jr
+ZXJgIHZhcmNoYXIoMzIpIE5PVCBOVUxMLAogIGBjbGllbnRfaXBgIHZhcmNoYXIoNDUpIE5PVCBO
+VUxMLAogIGByZXF1ZXN0X3VyaWAgdmFyY2hhcigyMDQ4KSBOT1QgTlVMTCwKICBgY3JlYXRlZF9h
+dGAgdGltZXN0YW1wIE5PVCBOVUxMIERFRkFVTFQgY3VycmVudF90aW1lc3RhbXAoKSwKICBQUklN
+QVJZIEtFWSAoYGlkYCkKKSBFTkdJTkU9SW5ub0RCIERFRkFVTFQgQ0hBUlNFVD11dGY4bWI0IENP
+TExBVEU9dXRmOG1iNF91Y2ExNDAwX2FpX2NpOwovKiE0MDEwMSBTRVQgY2hhcmFjdGVyX3NldF9j
+bGllbnQgPSBAc2F2ZWRfY3NfY2xpZW50ICovOwoKLS0KLS0gRHVtcGluZyBkYXRhIGZvciB0YWJs
+ZSBgcmVxdWVzdF9sb2dzYAotLQoKU0VUIEBPTERfQVVUT0NPTU1JVD1AQEFVVE9DT01NSVQsIEBA
+QVVUT0NPTU1JVD0wOwpMT0NLIFRBQkxFUyBgcmVxdWVzdF9sb2dzYCBXUklURTsKLyohNDAwMDAg
+QUxURVIgVEFCTEUgYHJlcXVlc3RfbG9nc2AgRElTQUJMRSBLRVlTICovOwovKiE0MDAwMCBBTFRF
+UiBUQUJMRSBgcmVxdWVzdF9sb2dzYCBFTkFCTEUgS0VZUyAqLzsKVU5MT0NLIFRBQkxFUzsKQ09N
+TUlUOwpTRVQgQVVUT0NPTU1JVD1AT0xEX0FVVE9DT01NSVQ7CgotLSBUaGUgZGVmZXJyZWQgZ3Rp
+ZCBzZXR0aW5nIGZvciBzbGF2ZSBjb3JyZXNwb25kaW5nIHRvIHRoZSBtYXN0ZXItZGF0YSBDSEFO
+R0UtTUFTVEVSIGZvbGxvd3MKCi0tIFByZWZlcmFibHkgdXNlIEdUSUQgdG8gc3RhcnQgcmVwbGlj
+YXRpb24gZnJvbSBHVElEIHBvc2l0aW9uOgoKLS0gU0VUIEdMT0JBTCBndGlkX3NsYXZlX3Bvcz0n
+MC0xLTYnOwovKiE0MDEwMyBTRVQgVElNRV9aT05FPUBPTERfVElNRV9aT05FICovOwoKLyohNDAx
+MDEgU0VUIFNRTF9NT0RFPUBPTERfU1FMX01PREUgKi87Ci8qITQwMDE0IFNFVCBGT1JFSUdOX0tF
+WV9DSEVDS1M9QE9MRF9GT1JFSUdOX0tFWV9DSEVDS1MgKi87Ci8qITQwMDE0IFNFVCBVTklRVUVf
+Q0hFQ0tTPUBPTERfVU5JUVVFX0NIRUNLUyAqLzsKLyohNDAxMDEgU0VUIENIQVJBQ1RFUl9TRVRf
+Q0xJRU5UPUBPTERfQ0hBUkFDVEVSX1NFVF9DTElFTlQgKi87Ci8qITQwMTAxIFNFVCBDSEFSQUNU
+RVJfU0VUX1JFU1VMVFM9QE9MRF9DSEFSQUNURVJfU0VUX1JFU1VMVFMgKi87Ci8qITQwMTAxIFNF
+VCBDT0xMQVRJT05fQ09OTkVDVElPTj1AT0xEX0NPTExBVElPTl9DT05ORUNUSU9OICovOwovKk0h
+MTAwNjE2IFNFVCBOT1RFX1ZFUkJPU0lUWT1AT0xEX05PVEVfVkVSQk9TSVRZICovOwoKLS0gRHVt
+cCBjb21wbGV0ZWQgb24gMjAyNi0xMC0xNSAxNToyNjoxNAo=
+EOF
+base64 -d /root/mariadb/shibuya-seed.b64 > /root/mariadb/shibuya-seed.sql
+sha256sum /root/mariadb/shibuya-seed.sql
+mariadb < /root/mariadb/shibuya-seed.sql
+sed -n '/^-- CHANGE MASTER TO/p' /root/mariadb/shibuya-seed.sql
+```
+
+##### `inumaki` : sambungkan replikasi
+
+```bash
+. /root/lab.env
+REPL_PASS='PASTE_REPLICATION_PASSWORD_FROM_YAGA'
+BINLOG_FILE='mariadb-bin.000001'
+BINLOG_POS='1720'
+cat > /root/mariadb/connect_replica.sql <<EOF
+CHANGE MASTER TO
+    MASTER_HOST='${YAGA}',
+    MASTER_USER='replicator',
+    MASTER_PASSWORD='${REPL_PASS}',
+    MASTER_PORT=3306,
+    MASTER_LOG_FILE='${BINLOG_FILE}',
+    MASTER_LOG_POS=${BINLOG_POS},
+    MASTER_CONNECT_RETRY=5;
+START SLAVE;
+SHOW SLAVE STATUS\G
+EOF
+mariadb < /root/mariadb/connect_replica.sql
+```
+
+##### `yaga` : tambah data uji
+
+```bash
+. /root/lab.env
+mariadb "$DB_NAME" -e "INSERT INTO request_logs (worker,client_ip,request_uri) VALUES ('replication-test','127.0.0.1','/replication-check');"
+mariadb "$DB_NAME" -e "SELECT * FROM request_logs ORDER BY id DESC LIMIT 5;"
+```
+
+##### `inumaki` : cek replikasi
+
+```bash
+. /root/lab.env
+mariadb -e 'SHOW SLAVE STATUS\G'
+mariadb "$DB_NAME" -e "SELECT * FROM request_logs ORDER BY id DESC LIMIT 5;"
+```
